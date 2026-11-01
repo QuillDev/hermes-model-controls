@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-model-controls"
+version = "0.1.0"
+description = "Shared model controls for Hermes clients"
+requires-python = ">=3.11"
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-asyncio"]
+
+[tool.setuptools]
+packages = []

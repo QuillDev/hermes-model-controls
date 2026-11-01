@@ -1,0 +1,5 @@
+name: model-controls
+version: 0.1.0
+description: Shared Hermes model catalogs, profile defaults and per-session model, effort and speed settings. Client plugins provide the UI.
+author: QuillDev
+license: MIT
