@@ -19,6 +19,80 @@ def providers():
             for row in payload.get("providers", []) if row.get("slug")]
 
 
+# Several linked logins are probed one after another; give them longer than core's single hook.
+ACCOUNTS_DEADLINE_S = 30.0
+
+
+def usage():
+    """Plan limits of every signed-in provider that reports them, one row per account:
+    [{provider, label, accounts: [{label, windows: [{label, used_percent, resets_at}], note}]}].
+    A provider plugin that links several logins itself answers `fetch_account_usage_by_account()`;
+    Hermes credential pools come from the picker inventory; anything else is one unlabeled account."""
+    from agent.account_usage_cache import has_account_usage
+    from hermes_cli.inventory import build_models_payload, load_picker_context
+
+    payload = build_models_payload(load_picker_context(), non_blocking_catalogs=True)
+    shown = []
+    for row in payload.get("providers", []):
+        slug = str(row.get("slug") or "")
+        if not slug or row.get("is_user_defined") or row.get("authenticated") is False:
+            continue
+        accounts = _linked_accounts(slug)
+        if accounts is None:
+            pooled = (row.get("usage") or {}).get("accounts")
+            if pooled:
+                accounts = [_pooled_account(account) for account in pooled]
+            elif has_account_usage(slug):
+                accounts = [_account("", _provider_snapshot(slug))]
+            else:
+                accounts = []
+        accounts = [account for account in accounts if account["windows"] or account["note"]]
+        if accounts:
+            shown.append({"provider": slug, "label": str(row.get("name") or slug), "accounts": accounts})
+    return shown
+
+
+def _linked_accounts(slug):
+    import logging
+    from agent.deadline import run_bounded_sync
+    from providers import get_provider_profile
+
+    try:
+        hook = getattr(get_provider_profile(slug), "fetch_account_usage_by_account", None)
+        if not callable(hook):
+            return None
+        bounded = run_bounded_sync(hook, ACCOUNTS_DEADLINE_S, label="account-usage-by-account")
+    except Exception:
+        logging.getLogger(__name__).debug("Per-account usage failed for %s", slug, exc_info=True)
+        return None
+    if bounded.timed_out or bounded.value is None:
+        return None
+    return [_account(str(label), snapshot) for label, snapshot in bounded.value]
+
+
+def _provider_snapshot(slug):
+    from agent.account_usage import fetch_account_usage
+    from agent.account_usage_cache import cached_account_usage, snapshot_is_stale
+
+    snapshot = cached_account_usage(slug)
+    return fetch_account_usage(slug) if snapshot is None or snapshot_is_stale(snapshot) else snapshot
+
+
+def _account(label, snapshot):
+    windows = [{"label": str(w.label), "used_percent": float(w.used_percent),
+                "resets_at": w.reset_at.isoformat() if w.reset_at else None}
+               for w in (snapshot.windows if snapshot else ()) if w.used_percent is not None]
+    note = None if windows else (getattr(snapshot, "unavailable_reason", None) or ("Usage unavailable" if snapshot is None else None))
+    return {"label": label, "windows": windows, "note": note}
+
+
+def _pooled_account(account):
+    windows = [{"label": str(w.get("label") or ""), "used_percent": float(w["used_percent"]), "resets_at": w.get("resets_at")}
+               for w in account.get("windows") or () if w.get("used_percent") is not None]
+    note = None if windows else ("Signed out" if account.get("state") == "unavailable" else "Usage unavailable")
+    return {"label": str(account.get("label") or ""), "windows": windows, "note": note}
+
+
 class Client:
     def __init__(self, *, home, runner, session_chat, source, active):
         self.home = Path(home)
@@ -37,6 +111,10 @@ class Client:
     def models(self):
         with self._profile_scope():
             return providers()
+
+    def usage(self):
+        with self._profile_scope():
+            return usage()
 
     def model(self):
         from hermes_cli.config import load_config
