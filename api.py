@@ -27,7 +27,9 @@ def usage():
     """Plan limits of every signed-in provider that reports them, one row per account:
     [{provider, label, accounts: [{label, windows: [{label, used_percent, resets_at}], note}]}].
     A provider plugin that links several logins itself answers `fetch_account_usage_by_account()`;
-    Hermes credential pools come from the picker inventory; anything else is one unlabeled account."""
+    Hermes credential pools come from the picker inventory; anything else is one unlabeled account.
+    Model-scoped windows (one model family's own cap, e.g. Fable's weekly limit) are left out: they
+    never say whether the account itself is out, and the shown limits are the account's."""
     from agent.account_usage_cache import has_account_usage
     from hermes_cli.inventory import build_models_payload, load_picker_context
 
@@ -81,14 +83,16 @@ def _provider_snapshot(slug):
 def _account(label, snapshot):
     windows = [{"label": str(w.label), "used_percent": float(w.used_percent),
                 "resets_at": w.reset_at.isoformat() if w.reset_at else None}
-               for w in (snapshot.windows if snapshot else ()) if w.used_percent is not None]
+               for w in (snapshot.windows if snapshot else ())
+               if w.used_percent is not None and getattr(w, "scope", "account") != "model"]
     note = None if windows else (getattr(snapshot, "unavailable_reason", None) or ("Usage unavailable" if snapshot is None else None))
     return {"label": label, "windows": windows, "note": note}
 
 
 def _pooled_account(account):
     windows = [{"label": str(w.get("label") or ""), "used_percent": float(w["used_percent"]), "resets_at": w.get("resets_at")}
-               for w in account.get("windows") or () if w.get("used_percent") is not None]
+               for w in account.get("windows") or ()
+               if w.get("used_percent") is not None and w.get("scope", "account") != "model"]
     note = None if windows else ("Signed out" if account.get("state") == "unavailable" else "Usage unavailable")
     return {"label": str(account.get("label") or ""), "windows": windows, "note": note}
 

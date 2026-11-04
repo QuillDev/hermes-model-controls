@@ -99,3 +99,13 @@ def test_a_failing_per_account_hook_falls_back_to_the_provider_total(api, hermes
     hermes.linked["claude"] = broken
     hermes.single["claude"] = _snapshot(AccountUsageWindow("Current week", 7))
     assert api.usage()[0]["accounts"] == [{"label": "", "windows": [{"label": "Current week", "used_percent": 7.0, "resets_at": None}], "note": None}]
+
+
+def test_a_model_scoped_cap_is_left_out_of_the_account_limits(api, hermes):
+    hermes.rows = [{"slug": "claude", "name": "Claude"},
+                   {"slug": "codex", "name": "Codex", "usage": {"accounts": [{"id": "a", "label": "work", "state": "ready", "windows": [
+                       {"label": "Weekly", "used_percent": 40.0, "resets_at": None, "scope": "account"},
+                       {"label": "Spark week", "used_percent": 90.0, "resets_at": None, "scope": "model"}]}]}}]
+    hermes.linked["claude"] = [("primary", _snapshot(AccountUsageWindow("Current week", 20), AccountUsageWindow("Fable week", 80, scope="model")))]
+    shown = {row["provider"]: [w["label"] for a in row["accounts"] for w in a["windows"]] for row in api.usage()}
+    assert shown == {"claude": ["Current week"], "codex": ["Weekly"]}
