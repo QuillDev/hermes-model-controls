@@ -69,7 +69,7 @@ def _linked_accounts(slug):
         return None
     if bounded.timed_out or bounded.value is None:
         return None
-    return [_account(str(label), snapshot) for label, snapshot in bounded.value]
+    return [_account(str(label), snapshot, account_id=str(label)) for label, snapshot in bounded.value]
 
 
 def _provider_snapshot(slug):
@@ -80,9 +80,51 @@ def _provider_snapshot(slug):
     return fetch_account_usage(slug) if snapshot is None or snapshot_is_stale(snapshot) else snapshot
 
 
+def _reset_options(raw_options):
+    if not isinstance(raw_options, list):
+        return []
+    out = []
+    for item in raw_options:
+        if not isinstance(item, dict):
+            continue
+        gid = item.get("id")
+        label = item.get("label")
+        avail = item.get("available")
+        if not isinstance(gid, str) or not gid or not isinstance(label, str) or not label:
+            continue
+        if isinstance(avail, bool) or not isinstance(avail, (int, float)):
+            continue
+        option = {
+            "id": gid,
+            "label": label,
+            "available": max(0, int(avail)),
+            "usable": bool(item.get("usable")) and int(avail) > 0,
+        }
+        expires_at = item.get("expires_at")
+        if isinstance(expires_at, str) and expires_at:
+            option["expires_at"] = expires_at
+        out.append(option)
+    return out
+
+
 def _resets(snapshot, *, account_id=""):
     raw = getattr(snapshot, "raw", None)
-    credits = raw.get("rate_limit_reset_credits") if isinstance(raw, dict) else None
+    if not isinstance(raw, dict):
+        return None
+    generic = raw.get("usage_resets")
+    if isinstance(generic, dict):
+        available = generic.get("available")
+        if not isinstance(available, bool) and isinstance(available, (int, float)):
+            count = max(0, int(available))
+            resets = {"available": count, "usable": bool(generic.get("usable")) and count > 0}
+            options = _reset_options(generic.get("options"))
+            if options:
+                resets["options"] = options
+            target = str(generic.get("account") or account_id or "")
+            if target:
+                resets["account"] = target
+            return resets
+    credits = raw.get("rate_limit_reset_credits")
     if not isinstance(credits, dict):
         return None
     available = credits.get("available_count")
@@ -100,14 +142,14 @@ def _resets(snapshot, *, account_id=""):
     return resets
 
 
-def _account(label, snapshot):
+def _account(label, snapshot, *, account_id=""):
     windows = [{"label": str(w.label), "used_percent": float(w.used_percent),
                 "resets_at": w.reset_at.isoformat() if w.reset_at else None}
                for w in (snapshot.windows if snapshot else ())
                if w.used_percent is not None and getattr(w, "scope", "account") != "model"]
     note = None if windows else (getattr(snapshot, "unavailable_reason", None) or ("Usage unavailable" if snapshot is None else None))
     row = {"label": label, "windows": windows, "note": note}
-    resets = _resets(snapshot)
+    resets = _resets(snapshot, account_id=account_id)
     if resets is not None:
         row["resets"] = resets
     return row
@@ -143,25 +185,38 @@ def _codex_reset_target(account):
     raise ValueError("Account not found")
 
 
-def use_reset(provider, account="", force=False):
-    """Redeem one banked usage reset credit for a supported provider (currently openai-codex)."""
+def use_reset(provider, account="", force=False, grant=""):
+    """Redeem one banked usage reset for Codex or any provider exposing `redeem_account_reset`."""
     from agent.account_usage import fetch_account_usage, redeem_codex_reset_credit
+    from providers import get_provider_profile
 
     slug = str(provider or "").strip().lower()
-    if slug != "openai-codex":
+    if slug == "openai-codex":
+        base_url, api_key, identity_id = _codex_reset_target(str(account or "").strip())
+        result = redeem_codex_reset_credit(base_url=base_url, api_key=api_key, force=bool(force))
+        if result.redeemed or result.status == "already_redeemed":
+            try:
+                fetch_account_usage(slug, base_url=base_url, api_key=api_key, identity_id=identity_id)
+            except Exception:
+                pass
+        return {
+            "status": result.status,
+            "redeemed": result.redeemed,
+            "message": result.message,
+            "available": result.available_count,
+        }
+
+    hook = getattr(get_provider_profile(slug), "redeem_account_reset", None) if slug else None
+    if not callable(hook):
         raise ValueError("That provider doesn't support usage resets")
-    base_url, api_key, identity_id = _codex_reset_target(str(account or "").strip())
-    result = redeem_codex_reset_credit(base_url=base_url, api_key=api_key, force=bool(force))
-    if result.redeemed or result.status == "already_redeemed":
-        try:
-            fetch_account_usage(slug, base_url=base_url, api_key=api_key, identity_id=identity_id)
-        except Exception:
-            pass
+    reply = hook(account=str(account or "").strip(), grant=str(grant or "").strip(), force=bool(force))
+    if not isinstance(reply, dict):
+        raise ValueError("Provider returned an invalid reset response")
     return {
-        "status": result.status,
-        "redeemed": result.redeemed,
-        "message": result.message,
-        "available": result.available_count,
+        "status": str(reply.get("status") or ""),
+        "redeemed": bool(reply.get("redeemed")),
+        "message": str(reply.get("message") or ""),
+        "available": reply.get("available"),
     }
 
 
@@ -188,9 +243,9 @@ class Client:
         with self._profile_scope():
             return usage()
 
-    def use_reset(self, provider, account="", force=False):
+    def use_reset(self, provider, account="", force=False, grant=""):
         with self._profile_scope():
-            return use_reset(provider, account=account, force=force)
+            return use_reset(provider, account=account, force=force, grant=grant)
 
     def model(self):
         from hermes_cli.config import load_config
