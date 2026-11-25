@@ -177,3 +177,41 @@ def test_use_reset_redeems_codex_credit_and_refreshes_usage(api, hermes, monkeyp
         api.use_reset("antigravity-oauth")
     with pytest.raises(ValueError, match="Account not found"):
         api.use_reset("openai-codex", account="missing")
+
+
+def test_provider_plugin_resets_surface_options_and_dispatch_redeem(api, hermes, monkeypatch):
+    import providers
+
+    claude_resets = {
+        "available": 3,
+        "usable": True,
+        "options": [
+            {"id": "full-reset-2611", "label": "weekly reset", "available": 1, "usable": True, "expires_at": "2026-12-10T22:00:00+00:00"},
+            {"id": "launch-2610-fable", "label": "Fable reset", "available": 2, "usable": True},
+        ],
+    }
+    hermes.rows = [{"slug": "claude-subscription-directsdk-experimental", "name": "Claude"}]
+    hermes.linked["claude-subscription-directsdk-experimental"] = [
+        ("work@example.test", AccountUsageSnapshot(
+            provider="claude-subscription-directsdk-experimental", source="claude_code_get_usage",
+            fetched_at=datetime.now(timezone.utc),
+            windows=(AccountUsageWindow("Current week", 18),),
+            raw={"usage_resets": claude_resets},
+        )),
+    ]
+
+    shown = api.usage()
+    assert shown[0]["accounts"][0]["resets"] == {**claude_resets, "account": "work@example.test"}
+
+    redeem_calls = []
+
+    def redeem_hook(*, account="", grant="", force=False):
+        redeem_calls.append((account, grant, force))
+        return {"status": "reset", "redeemed": True, "message": "Limits reset.", "available": 2}
+
+    monkeypatch.setattr(providers, "get_provider_profile", lambda slug: SimpleNamespace(
+        name=slug, redeem_account_reset=redeem_hook if slug == "claude-subscription-directsdk-experimental" else None,
+    ))
+    outcome = api.use_reset("claude-subscription-directsdk-experimental", account="work@example.test", grant="launch-2610-fable")
+    assert outcome == {"status": "reset", "redeemed": True, "message": "Limits reset.", "available": 2}
+    assert redeem_calls == [("work@example.test", "launch-2610-fable", False)]
