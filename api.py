@@ -25,11 +25,11 @@ ACCOUNTS_DEADLINE_S = 30.0
 
 def usage():
     """Plan limits of every signed-in provider that reports them, one row per account:
-    [{provider, label, accounts: [{label, windows: [{label, used_percent, resets_at}], note}]}].
+    [{provider, label, accounts: [{label, windows: [{label, used_percent, resets_at, scope?}], note}]}].
     A provider plugin that links several logins itself answers `fetch_account_usage_by_account()`;
     Hermes credential pools come from the picker inventory; anything else is one unlabeled account.
-    Model-scoped windows (one model family's own cap, e.g. Fable's weekly limit) are left out: they
-    never say whether the account itself is out, and the shown limits are the account's."""
+    A model-scoped window (one model family's own cap, e.g. Fable's weekly limit) carries
+    `scope: "model"`: it never says whether the account itself is out, so clients show it apart."""
     from agent.account_usage_cache import has_account_usage
     from hermes_cli.inventory import build_models_payload, load_picker_context
 
@@ -142,11 +142,17 @@ def _resets(snapshot, *, account_id=""):
     return resets
 
 
+def _window(label, used_percent, resets_at, scope):
+    window = {"label": label, "used_percent": used_percent, "resets_at": resets_at}
+    if scope == "model":
+        window["scope"] = "model"
+    return window
+
+
 def _account(label, snapshot, *, account_id=""):
-    windows = [{"label": str(w.label), "used_percent": float(w.used_percent),
-                "resets_at": w.reset_at.isoformat() if w.reset_at else None}
-               for w in (snapshot.windows if snapshot else ())
-               if w.used_percent is not None and getattr(w, "scope", "account") != "model"]
+    windows = [_window(str(w.label), float(w.used_percent), w.reset_at.isoformat() if w.reset_at else None,
+                       getattr(w, "scope", "account"))
+               for w in (snapshot.windows if snapshot else ()) if w.used_percent is not None]
     note = None if windows else (getattr(snapshot, "unavailable_reason", None) or ("Usage unavailable" if snapshot is None else None))
     row = {"label": label, "windows": windows, "note": note}
     resets = _resets(snapshot, account_id=account_id)
@@ -158,9 +164,8 @@ def _account(label, snapshot, *, account_id=""):
 def _pooled_account(slug, account):
     from agent.account_usage_cache import cached_account_usage, snapshot_is_stale
 
-    windows = [{"label": str(w.get("label") or ""), "used_percent": float(w["used_percent"]), "resets_at": w.get("resets_at")}
-               for w in account.get("windows") or ()
-               if w.get("used_percent") is not None and w.get("scope", "account") != "model"]
+    windows = [_window(str(w.get("label") or ""), float(w["used_percent"]), w.get("resets_at"), w.get("scope", "account"))
+               for w in account.get("windows") or () if w.get("used_percent") is not None]
     note = None if windows else ("Signed out" if account.get("state") == "unavailable" else "Usage unavailable")
     row = {"label": str(account.get("label") or ""), "windows": windows, "note": note}
     account_id = str(account.get("id") or "")
