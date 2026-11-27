@@ -4,6 +4,8 @@ Published as sys.modules["model_controls"] by register(). Each client supplies t
 runner, profile home and authorized source lookup; this plugin owns all settings.
 """
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 import hashlib
 import json
 from pathlib import Path
@@ -21,6 +23,24 @@ def providers():
 
 # Several linked logins are probed one after another; give them longer than core's single hook.
 ACCOUNTS_DEADLINE_S = 30.0
+_USAGE_MAX_WORKERS = 8
+
+
+def _provider_usage_row(row, has_account_usage):
+    slug = str(row.get("slug") or "")
+    accounts = _linked_accounts(slug)
+    if accounts is None:
+        pooled = (row.get("usage") or {}).get("accounts")
+        if pooled:
+            accounts = [_pooled_account(slug, account) for account in pooled]
+        elif has_account_usage(slug):
+            accounts = [_account("", _provider_snapshot(slug))]
+        else:
+            accounts = []
+    accounts = [account for account in accounts if account["windows"] or account["note"]]
+    if not accounts:
+        return None
+    return {"provider": slug, "label": str(row.get("name") or slug), "accounts": accounts}
 
 
 def usage():
@@ -34,24 +54,23 @@ def usage():
     from hermes_cli.inventory import build_models_payload, load_picker_context
 
     payload = build_models_payload(load_picker_context(), non_blocking_catalogs=True)
-    shown = []
-    for row in payload.get("providers", []):
-        slug = str(row.get("slug") or "")
-        if not slug or row.get("is_user_defined") or row.get("authenticated") is False:
-            continue
-        accounts = _linked_accounts(slug)
-        if accounts is None:
-            pooled = (row.get("usage") or {}).get("accounts")
-            if pooled:
-                accounts = [_pooled_account(slug, account) for account in pooled]
-            elif has_account_usage(slug):
-                accounts = [_account("", _provider_snapshot(slug))]
-            else:
-                accounts = []
-        accounts = [account for account in accounts if account["windows"] or account["note"]]
-        if accounts:
-            shown.append({"provider": slug, "label": str(row.get("name") or slug), "accounts": accounts})
-    return shown
+    candidates = [
+        row for row in payload.get("providers", [])
+        if str(row.get("slug") or "") and not row.get("is_user_defined") and row.get("authenticated") is not False
+    ]
+    if len(candidates) <= 1:
+        rows = [_provider_usage_row(row, has_account_usage) for row in candidates]
+    else:
+        with ThreadPoolExecutor(
+            max_workers=min(len(candidates), _USAGE_MAX_WORKERS),
+            thread_name_prefix="model-controls-usage",
+        ) as pool:
+            futures = [
+                pool.submit(copy_context().run, _provider_usage_row, row, has_account_usage)
+                for row in candidates
+            ]
+            rows = [future.result() for future in futures]
+    return [row for row in rows if row is not None]
 
 
 def _linked_accounts(slug):
