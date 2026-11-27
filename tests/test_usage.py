@@ -216,3 +216,40 @@ def test_provider_plugin_resets_surface_options_and_dispatch_redeem(api, hermes,
     outcome = api.use_reset("claude-subscription-directsdk-experimental", account="work@example.test", grant="launch-2610-fable")
     assert outcome == {"status": "reset", "redeemed": True, "message": "Limits reset.", "available": 2}
     assert redeem_calls == [("work@example.test", "launch-2610-fable", False)]
+
+
+def test_usage_probes_multiple_providers_concurrently_and_preserves_order_and_context(api, hermes, monkeypatch):
+    import contextvars
+    import threading
+    import agent.account_usage as account_usage
+
+    profile_var = contextvars.ContextVar("test_profile", default="unset")
+    barrier = threading.Barrier(3, timeout=5.0)
+    seen_context = {}
+
+    hermes.rows = [
+        {"slug": "alpha", "name": "Alpha"},
+        {"slug": "beta", "name": "Beta"},
+        {"slug": "gamma", "name": "Gamma"},
+    ]
+    hermes.single = {
+        "alpha": _snapshot(AccountUsageWindow("5h", 10)),
+        "beta": _snapshot(AccountUsageWindow("5h", 20)),
+        "gamma": _snapshot(AccountUsageWindow("5h", 30)),
+    }
+
+    def concurrent_fetch(slug, **_):
+        seen_context[slug] = profile_var.get()
+        barrier.wait()
+        return hermes.single[slug]
+
+    monkeypatch.setattr(account_usage, "fetch_account_usage", concurrent_fetch)
+
+    token = profile_var.set("isolated-profile")
+    try:
+        shown = api.usage()
+    finally:
+        profile_var.reset(token)
+
+    assert [row["provider"] for row in shown] == ["alpha", "beta", "gamma"]
+    assert seen_context == {"alpha": "isolated-profile", "beta": "isolated-profile", "gamma": "isolated-profile"}
